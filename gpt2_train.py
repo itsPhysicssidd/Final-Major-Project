@@ -308,7 +308,8 @@ class DataLoaderLite:
         assert split in {'train', 'val'}
 
         # Get shard filenames
-        data_root = "edu_fineweb10B"
+        
+        data_root = r"C:\Users\LENOVO LOQ\Documents\data\edu_fineweb10B"
         shards = os.listdir(data_root)
         shards = [s for s in shards if split in s]
         shards = sorted(shards)
