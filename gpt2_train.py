@@ -41,12 +41,9 @@ class CasualSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) #(B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) #same
         v = v.view(B, T, self.n_head, C // self.n_head). transpose(1, 2) #same
-
         #attention- materializes the large (T, T) matrix for all the queries and keys
-
         #att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
         #att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
-
         #applying casual mask to block future tokens
         #att = F.softmax(att, dim = -1)
         #y = att @ v #(B, nh, T, T) * (B, nh, T, T) -> (B, nh, T, hs)
@@ -308,15 +305,14 @@ class DataLoaderLite:
         assert split in {'train', 'val'}
 
         # Get shard filenames
-        
-        data_root = r"C:\Users\LENOVO LOQ\Documents\data\edu_fineweb10B"
+        data_root = "edu_fineweb10B"
         shards = os.listdir(data_root)
         shards = [s for s in shards if split in s]
         shards = sorted(shards)
         shards = [os.path.join(data_root, s) for s in shards]
         self.shards = shards
         assert len(shards) > 0, f"No shards found for split {split}"
-        master_process = 0
+        master_process = 1
         if master_process:
             print(f"Found {len(shards)} shards for split {split}")
         self.reset() #reset the dataloader
@@ -329,17 +325,26 @@ class DataLoaderLite:
 
     def next_batch(self):
         B, T = self.B, self.T
+
+        needed = B * T + 1
+
+    # If not enough tokens left, load the next shard
+        while self.current_position + needed > len(self.tokens):
+            self.current_shard = (self.current_shard + 1) % len(self.shards)
+            self.tokens = load_tokens(self.shards[self.current_shard])
+            self.current_position = 0  # reset position in new shard
+        # Check if we have enough tokens left in the current shard
         buf = self.tokens[self.current_position : self.current_position+B*T+1]
         x = (buf[:-1]).view(B, T)#inputs
         y = (buf[:-1]).view(B, T) #targets
 
         #advance the position in the tensor
         self.current_position +=B*T*self.num_processes
-
+        #if we run out of tokens, load the next shard
         if self.current_position+(B * T * self.num_processes+1)> len(self.tokens):
             self.current_shard = (self.current_shard + 1) %len(self.shards)
-            self.tokens = load_tokens(self.shards[self.current_Shard])
-            self.current_position = B * T * self.process_rank
+            self.tokens = load_tokens(self.shards[self.current_shard])
+            #self.current_position = B * T * self.process_rank
         return x,y
        
 #------------------------------------------------------------------------------------------8
@@ -377,8 +382,8 @@ grad_accum_steps = 32 # we manually set to 32 but formula is , total_batch_size 
 print(f"total desired batch size : {total_batch_size}")
 print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
 
-train_loader = DataLoaderLite(B = 8, T = 256, num_processes=1, split = 'train')
-val_loader = DataLoaderLite(B = 8, T = 256 , num_processes=1, split = "val")
+train_loader = DataLoaderLite(B = 8, T = 512, num_processes=1, split = 'train')
+val_loader = DataLoaderLite(B = 8, T = 512 , num_processes=1, split = "val")
 #enabling TF32 precision : because in every nn.Linear inside there is matrix multiplication, so expecting that matrix mul to be running on tensor course utilizing the TF32 precision (%).
 torch.set_float32_matmul_precision('high') #scale our throughput like 8x times, 3x times
 
@@ -395,7 +400,7 @@ model = torch.compile(model, backend="eager")
 max_lr = 6e-4
 min_lr = max_lr * 0.1
 warmup_steps = 715 #gpt 3 paper says they warmup the learning rate over 375 million tokens so 37fe6/2**19 = 715 steps  
-max_steps = 10 #10B /2**19 == around 19,073 steps
+max_steps = 5000 #10B /2**19 == around 19,073 steps
 def get_lr(it):
     #i. linear warmup for warmup_iters steps
     if it < warmup_steps:
@@ -409,9 +414,14 @@ def get_lr(it):
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) #coeff starts at 1 and goes to 0
     return min_lr + coeff * (max_lr - min_lr)
  
+
+log_dir = "log"
+os.makedirs(log_dir, exist_ok=True)
+log_file = os.path.join(log_dir, f"log.txt")
+with open(log_file, 'w') as f:
+    pass
 #optimize
 #optimizer = torch.optim.AdamW(model.parameters(), lr = 3e-5, betas = (0.9, 0.95), eps = 1e-8)
-
 import time
 import warnings
 
@@ -419,11 +429,6 @@ from torch.amp import autocast, GradScaler
 
 # === FORCE model to float32 ===
 model = model.to(dtype=torch.float16)  #  This is CRUCIAL to fix the bfloat16 crash
-
-# === CONFIG ===
-checkpoint_path = "checkpoint.pt"
-resume_training = True
-save_every = 500
 
 # === OPTIMIZER ===
 optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=device)
@@ -433,21 +438,20 @@ with warnings.catch_warnings():
     warnings.simplefilter("ignore", category=FutureWarning)
     scaler = GradScaler(device='cuda')
 
-# === RESUME FROM CHECKPOINT IF AVAILABLE ===
-start_step = 0
-if resume_training and os.path.exists(checkpoint_path):
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-    if all(k in checkpoint for k in ['model_state', 'optimizer_state', 'scaler_state', 'step']):
-        try:
-            model._orig_mod.load_state_dict(checkpoint["model_state"])
-            optimizer.load_state_dict(checkpoint["optimizer_state"])
-            scaler.load_state_dict(checkpoint["scaler_state"])
-            start_step = checkpoint["step"] + 1
-            print(f" Resumed training from step {start_step}")
-        except Exception as e:
-            print(" Failed to load checkpoint properly:", e)
-    else:
-        print(" Checkpoint missing expected keys. Starting from scratch.")
+ #LOAD CHECKPOINT IF EXISTS ===
+resume_path = os.path.join(log_dir, 'model_04700.pt')  # Or the latest checkpoint
+if os.path.exists(resume_path):
+    checkpoint = torch.load(resume_path, map_location=device)
+    model.load_state_dict(checkpoint['model'])
+    #optimizer.load_state_dict(checkpoint['optimizer'])
+    # scheduler.load_state_dict(checkpoint['scheduler'])  # If you're using scheduler and saving it
+    start_step = checkpoint['step'] + 1
+    print(f"Resumed training from step {start_step}")
+else:
+    print("Starting training from scratch")
+
+start_step = checkpoint['step'] + 1 if 'step' in checkpoint else 0
+
 # === TRAINING LOOP ===
 for step in range(start_step, max_steps):
     t0 = time.time()
@@ -467,11 +471,22 @@ for step in range(start_step, max_steps):
                 loss = loss / val_loss_steps
                 val_loss_accum += loss.detach()
                 
-            master_process = 0
+            master_process = 1
             if master_process:
                 print(f"validation loss: {val_loss_accum.item():.4f}")
+                with open(log_file, 'a') as f:
+                    f.write(f"{step} val{val_loss_accum.item():.4f}\n")
 
-    if step>0 and step % 100 == 0:
+                if step > 0 and step % 100 == 0:
+        
+                    checkpoint_path = os.path.join(log_dir, f"model_{step:05d}.pt")
+                    checkpoint = {'model' : model.state_dict(),
+                                  'config':model.config,
+                                  'step': step,
+                                  'val_loss' : val_loss_accum.item(),
+                                  }
+                    torch.save(checkpoint, checkpoint_path)  
+
         model.eval()
         num_return_sequences = 4
         max_length= 32
@@ -503,12 +518,12 @@ for step in range(start_step, max_steps):
                 xcol = torch.gather(topk_indices, -1, ix) #(B, 1)
 
                 #append to the sequence
-                x = torch.cat((xgen, xcol), dim = 1)          
+                xgen = torch.cat((xgen, xcol), dim = 1)          
     
         #print the generated text
         for i in range(num_return_sequences):
             tokens = xgen[i, :max_length].tolist()
-            decoded= enc.decoded(tokens)
+            decoded= enc.decode(tokens)
             print(f"sample {i}: {decoded}")
 
     #training loop
@@ -544,18 +559,10 @@ for step in range(start_step, max_steps):
     t1 = time.time()
     dt = (t1 - t0) * 1000
     tokens_per_sec = (train_loader.B * train_loader.T * grad_accum_steps) / (t1 - t0)
-    master_process = 0
+    master_process = 1
     if master_process:
         print(f"step {step} | loss: {loss_accum.item():.6f} | lr : {lr:.4e} | dt: {dt:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
 
-    if step % save_every == 0:
-        torch.save({
-            "model_state": model.state_dict(),
-            "optimizer_state": optimizer.state_dict(),
-            "scaler_state": scaler.state_dict(),
-            "step": step
-        }, checkpoint_path)
-        print(f"Checkpoint saved at step {step}")
 
     del x, y, logits, loss
     torch.cuda.empty_cache()
@@ -565,15 +572,15 @@ for step in range(start_step, max_steps):
 #print(loss) #and our loss comes like 10.9687
 #and the thing is : cross entropy loss = -log(1/50257) ~= 10.82 so at initialization(we expect this) so not bad. Its the probability we expect, now performing the optimization
 
-import sys; sys.exit(0)
+#import sys; sys.exit(0)
 #-------------------------------------------------------------------------
-model = GPT.from_pretrained('gpt2')
-print("nice!")
+#model = GPT.from_pretrained('gpt2')
+#print("nice!")
         
 #-------------------------------------------------------------------------------------------------------------------7
 
-num_return_sequences = 5
-max_length = 30
+#num_return_sequences = 5
+#max_length = 30
 
 #creating the prefix tokens - the starting some words or sentence before generating the tokens
 
